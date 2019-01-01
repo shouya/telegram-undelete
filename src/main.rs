@@ -5,6 +5,7 @@ extern crate diesel;
 // extern crate telegram_bot_fork;
 // extern crate tokio;
 //
+use chrono::{DateTime, Local};
 use diesel::{Connection, RunQueryDsl};
 use futures::{future, Future, Stream};
 use std;
@@ -45,8 +46,9 @@ fn get_args() -> clap::ArgMatches<'static> {
         .get_matches()
 }
 
+#[derive(Clone)]
 struct Config {
-    chat_id: String,
+    chat_id: i64,
 }
 
 fn establish_connection(file: &str) -> DBConnection {
@@ -54,6 +56,7 @@ fn establish_connection(file: &str) -> DBConnection {
         .expect("Unable to establish sqlite connection to specified file")
 }
 
+#[derive(Debug)]
 enum MediaType {
     Photo,
     Document,
@@ -64,7 +67,7 @@ enum MediaType {
     Venue,
 }
 
-#[derive(diesel::Queryable)]
+#[derive(Debug)]
 struct Media {
     id: i64,
     media_type: MediaType,
@@ -73,10 +76,12 @@ struct Media {
     extra: String,
 }
 
+#[derive(Debug)]
 struct Message {
     id: i64,
     user_name: String,
     user_id: i64,
+    date: DateTime<Local>,
     reply_to: Option<i64>,
     text: String,
     media: Option<Media>,
@@ -120,11 +125,51 @@ impl Media {
     }
 }
 
+impl Message {
+    fn send_request(
+        &self,
+        bot: &tg::Api,
+        conf: &Config,
+    ) -> impl Future<Item = i64, Error = ()> {
+        future::err(())
+    }
+
+    fn send_text(
+        &self,
+        bot: &tg::Api,
+        conf: &Config,
+    ) -> impl Future<Item = i64, Error = ()> {
+        bot.send(tg::requests::SendMessage::new(
+            tg::types::ChatId(conf.chat_id),
+            self.text_content(),
+        ))
+        .map(|msg| msg.id.into())
+        .map_err(|_| ())
+    }
+
+    fn text_content(&self) -> String {
+        if self.text.len() > 0 {
+            format!("{}:\n{}", self.user_name, self.text)
+        } else {
+            format!("(from {})", self.user_name)
+        }
+    }
+
+    fn media_desc(&self) -> Option<String> {
+        self.media.as_ref().map(|m| match &m.name {
+            None => format!("{:?}", m.media_type),
+            Some(n) => format!("{:?} ({})", m.media_type, n),
+        })
+    }
+}
+
 impl diesel::deserialize::QueryableByName<DB> for Message {
     fn build<R: diesel::row::NamedRow<DB>>(
         row: &R,
     ) -> diesel::deserialize::Result<Self> {
+        use chrono::TimeZone;
         use diesel::sql_types::*;
+
         let media = Media::parse_row(
             row.get::<Nullable<BigInt>, _>("media_id")?,
             row.get::<Nullable<Text>, _>("media_type")?,
@@ -132,11 +177,13 @@ impl diesel::deserialize::QueryableByName<DB> for Message {
             row.get::<Nullable<Text>, _>("media_name")?,
             row.get::<Nullable<Text>, _>("media_extra")?,
         );
+        let date = Local.from_utc_datetime(&row.get::<Timestamp, _>("date")?);
 
         Ok(Message {
             id: row.get::<BigInt, _>("id")?,
             user_name: row.get::<Text, _>("first_name")?,
             user_id: row.get::<BigInt, _>("user_id")?,
+            date: date,
             reply_to: row.get::<Nullable<BigInt>, _>("reply_to")?,
             text: row.get::<Text, _>("text")?,
             media: media,
@@ -144,8 +191,19 @@ impl diesel::deserialize::QueryableByName<DB> for Message {
     }
 }
 
-fn convert_id(old_id: i64, db: &DBConnection) -> Option<i64> {
-    unimplemented!()
+fn convert_id(old_id: i64, conn: &DBConnection) -> Option<i64> {
+    use diesel::sql_types::*;
+    diesel::dsl::sql::<BigInt>(
+        "
+        SELECT NewID
+        FROM MessageIDMigration
+        WHERE OldID = ?
+        AND NewID IS NOT NULL
+        ",
+    )
+    .bind::<BigInt, _>(old_id)
+    .get_result(conn)
+    .ok()
 }
 
 fn next_message_id_query(conn: &DBConnection) -> Option<i64> {
@@ -177,6 +235,7 @@ fn fetch_next_message(conn: &DBConnection) -> Option<Message> {
                u.FirstName       AS first_name,
                u.ID              AS user_id,
                m.ReplyMessageID  AS reply_to,
+               m.Date            AS date,
                m.Message         AS text,
                p.ID              AS media_id,
                p.Type            AS media_type,
@@ -197,12 +256,13 @@ fn fetch_next_message(conn: &DBConnection) -> Option<Message> {
 
 fn send_request(
     bot: &tg::Api,
-    req: Message,
+    msg: &Message,
+    conf: &Config,
 ) -> impl Future<Item = i64, Error = ()> {
-    future::err(())
+    msg.send_request(bot, conf)
 }
 
-fn save_log(id: i64) -> impl Future<Item = (), Error = ()> {
+fn save_log(msg: &Message, new_id: i64) -> impl Future<Item = (), Error = ()> {
     future::err(())
 }
 
@@ -213,44 +273,13 @@ fn make_processing_stream(
 ) -> impl Stream<Item = (), Error = ()> + Send {
     futures::stream::unfold((), move |()| {
         let bot = tg::Api::new(&token).unwrap();
+        let conf = conf.clone();
         fetch_next_message(&conn).map(move |msg| {
-            send_request(&bot, msg).and_then(save_log).map(|_| ((), ()))
+            send_request(&bot, &msg, &conf)
+                .and_then(move |new_id| save_log(&msg, new_id))
+                .map(|_| ((), ()))
         })
     })
-}
-
-mod schema {
-    use diesel::*;
-
-    table! {
-        message {
-            #[sql_name = "ID"]
-            id -> BigInt,
-            #[sql_name = "FromID"]
-            from_id -> BigInt,
-            #[sql_name = "MediaID"]
-            media_id -> Nullable<BigInt>,
-            #[sql_name = "Message"]
-            text -> Text,
-            #[sql_name = "ReplyID"]
-            reply_id -> Nullable<BigInt>,
-            #[sql_name = "ServiceAction"]
-            service_action -> Nullable<Text>,
-        }
-    }
-
-    table! {
-        media {
-            #[sql_name = "ID"]
-            id -> BigInt,
-            #[sql_name = "MIMEType"]
-            mime_type -> Text,
-            #[sql_name = "Name"]
-            name -> Nullable<Text>,
-            #[sql_name = "Extra"]
-            extra -> Text,
-        }
-    }
 }
 
 fn init_db_table(conn: &DBConnection) {
@@ -274,7 +303,11 @@ fn main() {
     let token: String = args.value_of("token").unwrap().into();
     let conn = establish_connection(args.value_of("db").unwrap());
     let conf = Config {
-        chat_id: args.value_of("chat").unwrap().into(),
+        chat_id: args
+            .value_of("chat")
+            .unwrap()
+            .parse()
+            .expect("Chat ID is not an integer"),
     };
 
     init_db_table(&conn);
