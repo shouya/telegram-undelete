@@ -1,6 +1,9 @@
 // extern crate clap;
 #[macro_use]
 extern crate diesel;
+
+#[macro_use]
+extern crate serde_derive;
 // extern crate futures;
 // extern crate telegram_bot_fork;
 // extern crate tokio;
@@ -8,7 +11,9 @@ extern crate diesel;
 use chrono::{DateTime, Local};
 use diesel::{Connection, RunQueryDsl};
 use futures::{future, Future, Stream};
+use serde;
 use std;
+use std::path::{Path, PathBuf};
 use telegram_bot_fork as tg;
 use telegram_bot_fork_raw as tg_raw;
 
@@ -43,12 +48,20 @@ fn get_args() -> clap::ArgMatches<'static> {
                 .long("chat")
                 .required(true),
         )
+        .arg(
+            Arg::with_name("media-dir")
+                .takes_value(true)
+                .long("media-dir")
+                .required(true),
+        )
         .get_matches()
 }
 
 #[derive(Clone)]
 struct Config {
     chat_id: i64,
+    token: String,
+    media_dir: String,
 }
 
 fn establish_connection(file: &str) -> DBConnection {
@@ -79,12 +92,37 @@ struct Media {
 #[derive(Debug)]
 struct Message {
     id: i64,
+    new_id: Option<i64>,
     user_name: String,
     user_id: i64,
     date: DateTime<Local>,
     reply_to: Option<i64>,
+    reply_to_new_id: Option<i64>,
     text: String,
     media: Option<Media>,
+}
+
+#[derive(Deserialize)]
+struct WithMessageId {
+    message_id: i64,
+}
+
+impl std::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                MediaType::Photo => "photo",
+                MediaType::Document => "document",
+                MediaType::Webpage => "webpage",
+                MediaType::Geo => "geo",
+                MediaType::Geolive => "geolive",
+                MediaType::Venue => "venue",
+                MediaType::Contact => "contact",
+            }
+        )
+    }
 }
 
 impl Media {
@@ -123,28 +161,121 @@ impl Media {
             extra,
         })
     }
+
+    fn caption(&self) -> String {
+        let mut s = format!("({})", self.media_type);
+        match self.name {
+            Some(n) => format!("{} {}", s, n),
+            None => s,
+        }
+    }
+
+    fn caption_timestamped(&self, t: &DateTime<Local>) -> String {
+        format!("{}\n{}", self.caption(), t.to_rfc3339())
+    }
+
+    fn find_file(&self, dir: &str) -> Option<PathBuf> {
+        let pat = format!("{}/{}-*.{}.*", dir, self.media_type, self.id);
+        let mut paths: Vec<PathBuf> = glob::glob(&pat)
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect();
+        match paths.len().clone() {
+            0 => None,
+            _ => paths.pop(),
+        }
+    }
+
+    fn file_part(&self, dir: &str) -> Option<reqwest::multipart::Part> {
+        let file = self.find_file(dir)?;
+        let raw_part = reqwest::multipart::Part::file(file).ok()?;
+        let part_with_mime = reqwest::multipart::Part::file(file)
+            .ok()?
+            .mime_str(&self.mime_type)
+            .ok();
+        let part = part_with_mime.or(Some(raw_part))?;
+        let part_with_name = part.file_name(&Self::clean_filename(file));
+        Some(part_with_name)
+    }
+
+    fn clean_filename(p: PathBuf) -> String {
+        let file: &Path = p.file_name().unwrap().as_ref();
+        let file_pure = if file.starts_with("document-") {
+            file.strip_prefix("document-").unwrap()
+        } else {
+            file.strip_prefix("photo-").unwrap()
+        };
+        let real_ext = file_pure.extension().unwrap();
+        let stem_and_id: &Path = file_pure.file_stem().unwrap().as_ref();
+        let stem = stem_and_id.file_stem().unwrap();
+        format!("{}.{}", stem.to_str().unwrap(), real_ext.to_str().unwrap())
+    }
 }
 
 impl Message {
-    fn send_request(
-        &self,
-        bot: &tg::Api,
-        conf: &Config,
-    ) -> impl Future<Item = i64, Error = ()> {
-        future::err(())
+    fn send_request(&self, conf: &Config) -> Option<i64> {
+        if self.media.is_none() {
+            return self.send_text(conf);
+        }
+
+        let media = self.media?;
+
+        match media.media_type {
+            MediaType::Photo => return self.send_photo(conf, &media),
+            MediaType::Document => return self.send_document(conf, &media),
+            _ => return self.send_other_media(conf, &media),
+        }
     }
 
-    fn send_text(
-        &self,
-        bot: &tg::Api,
-        conf: &Config,
-    ) -> impl Future<Item = i64, Error = ()> {
-        bot.send(tg::requests::SendMessage::new(
-            tg::types::ChatId(conf.chat_id),
+    fn send_text(&self, conf: &Config) -> Option<i64> {
+        let bot = tg::Api::new(&conf.token).unwrap();;
+        let req = tg::requests::SendMessage::new(
+            tg::types::ChatId::new(conf.chat_id),
             self.text_content(),
-        ))
-        .map(|msg| msg.id.into())
-        .map_err(|_| ())
+        );
+        tokio::runtime::current_thread::block_on_all(future::lazy(move || {
+            bot.send(req).map(|msg| msg.id.into())
+        }))
+        .ok()
+    }
+
+    fn send_photo(&self, conf: &Config, media: &Media) -> Option<i64> {
+        let client = reqwest::Client::new();
+        let file = media.file_part(&conf.media_dir)?;
+        let url =
+            format!("https://api.telegram.org/bot{}/sendPhoto", conf.token);
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", &conf.chat_id.to_string())
+            .text("caption", media.caption_timestamped(&self.date))
+            .text("reply_to_message_id", self.reply_to_param())
+            .part("photo", file);
+
+        let resp = client.post(&url).multipart(form).send().ok()?;
+        let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
+        Some(msg_id)
+    }
+
+    fn send_document(&self, conf: &Config, media: &Media) -> Option<i64> {
+        let client = reqwest::Client::new();
+        let file = media.file_part(&conf.media_dir)?;
+        let url =
+            format!("https://api.telegram.org/bot{}/sendPhoto", conf.token);
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", &conf.chat_id.to_string())
+            .text("caption", media.caption_timestamped(&self.date))
+            .text("reply_to_message_id", self.reply_to_param())
+            .part("photo", file);
+
+        let resp = client.post(&url).multipart(form).send().ok()?;
+        let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
+        Some(msg_id)
+    }
+
+    fn reply_to_param(&self) -> String {
+        match self.reply_to_new_id {
+            None => "".into(),
+            Some(i) => i.to_string(),
+        }
     }
 
     fn text_content(&self) -> String {
@@ -153,6 +284,10 @@ impl Message {
         } else {
             format!("(from {})", self.user_name)
         }
+    }
+
+    fn format_date(&self) -> String {
+        self.date.to_rfc3339()
     }
 
     fn media_desc(&self) -> Option<String> {
@@ -181,10 +316,12 @@ impl diesel::deserialize::QueryableByName<DB> for Message {
 
         Ok(Message {
             id: row.get::<BigInt, _>("id")?,
+            new_id: None,
             user_name: row.get::<Text, _>("first_name")?,
             user_id: row.get::<BigInt, _>("user_id")?,
             date: date,
             reply_to: row.get::<Nullable<BigInt>, _>("reply_to")?,
+            reply_to_new_id: None,
             text: row.get::<Text, _>("text")?,
             media: media,
         })
@@ -254,32 +391,20 @@ fn fetch_next_message(conn: &DBConnection) -> Option<Message> {
     .ok()
 }
 
-fn send_request(
-    bot: &tg::Api,
-    msg: &Message,
-    conf: &Config,
-) -> impl Future<Item = i64, Error = ()> {
-    msg.send_request(bot, conf)
+fn save_log(msg: &Message, new_id: &Option<i64>) {
+    unimplemented!()
 }
 
-fn save_log(msg: &Message, new_id: i64) -> impl Future<Item = (), Error = ()> {
-    future::err(())
-}
-
-fn make_processing_stream(
-    token: String,
-    conn: DBConnection,
-    conf: Config,
-) -> impl Stream<Item = (), Error = ()> + Send {
-    futures::stream::unfold((), move |()| {
-        let bot = tg::Api::new(&token).unwrap();
+fn process_messages(conn: DBConnection, conf: Config) {
+    loop {
         let conf = conf.clone();
-        fetch_next_message(&conn).map(move |msg| {
-            send_request(&bot, &msg, &conf)
-                .and_then(move |new_id| save_log(&msg, new_id))
-                .map(|_| ((), ()))
-        })
-    })
+        let msg = match fetch_next_message(&conn) {
+            None => break,
+            Some(m) => m,
+        };
+        let id = msg.send_request(&conf);
+        save_log(&msg, &id);
+    }
 }
 
 fn init_db_table(conn: &DBConnection) {
@@ -300,7 +425,6 @@ fn init_db_table(conn: &DBConnection) {
 
 fn main() {
     let args = get_args();
-    let token: String = args.value_of("token").unwrap().into();
     let conn = establish_connection(args.value_of("db").unwrap());
     let conf = Config {
         chat_id: args
@@ -308,12 +432,13 @@ fn main() {
             .unwrap()
             .parse()
             .expect("Chat ID is not an integer"),
+        token: args.value_of("token").unwrap().into(),
+        media_dir: args.value_of("media-dir").unwrap().into(),
     };
 
     init_db_table(&conn);
 
-    let stream = make_processing_stream(token, conn, conf);
-    tokio::run(stream.for_each(|_| future::ok(())));
+    process_messages(conn, conf);
 
     println!("Hello, world! {:?}", args);
 }
