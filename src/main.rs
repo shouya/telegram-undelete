@@ -92,7 +92,6 @@ struct Media {
 #[derive(Debug)]
 struct Message {
     id: i64,
-    new_id: Option<i64>,
     user_name: String,
     user_id: i64,
     date: DateTime<Local>,
@@ -164,7 +163,7 @@ impl Media {
 
     fn caption(&self) -> String {
         let mut s = format!("({})", self.media_type);
-        match self.name {
+        match &self.name {
             Some(n) => format!("{} {}", s, n),
             None => s,
         }
@@ -188,18 +187,19 @@ impl Media {
 
     fn file_part(&self, dir: &str) -> Option<reqwest::multipart::Part> {
         let file = self.find_file(dir)?;
-        let raw_part = reqwest::multipart::Part::file(file).ok()?;
-        let part_with_mime = reqwest::multipart::Part::file(file)
+        let raw_part = reqwest::multipart::Part::file(&file).ok()?;
+        let part_with_mime = reqwest::multipart::Part::file(&file)
             .ok()?
             .mime_str(&self.mime_type)
             .ok();
         let part = part_with_mime.or(Some(raw_part))?;
-        let part_with_name = part.file_name(&Self::clean_filename(file));
+        let file_name = Self::clean_filename(&file);
+        let part_with_name = part.file_name(file_name);
         Some(part_with_name)
     }
 
-    fn clean_filename(p: PathBuf) -> String {
-        let file: &Path = p.file_name().unwrap().as_ref();
+    fn clean_filename<P: AsRef<Path>>(p: P) -> String {
+        let file: &Path = p.as_ref().file_name().unwrap().as_ref();
         let file_pure = if file.starts_with("document-") {
             file.strip_prefix("document-").unwrap()
         } else {
@@ -218,9 +218,9 @@ impl Message {
             return self.send_text(conf);
         }
 
-        let media = self.media?;
+        let media = self.media.as_ref()?;
 
-        match media.media_type {
+        match &media.media_type {
             MediaType::Photo => return self.send_photo(conf, &media),
             MediaType::Document => return self.send_document(conf, &media),
             _ => return self.send_other_media(conf, &media),
@@ -245,12 +245,12 @@ impl Message {
         let url =
             format!("https://api.telegram.org/bot{}/sendPhoto", conf.token);
         let form = reqwest::multipart::Form::new()
-            .text("chat_id", &conf.chat_id.to_string())
+            .text("chat_id",(&conf.chat_id).to_string())
             .text("caption", media.caption_timestamped(&self.date))
             .text("reply_to_message_id", self.reply_to_param())
             .part("photo", file);
 
-        let resp = client.post(&url).multipart(form).send().ok()?;
+        let mut resp = client.post(&url).multipart(form).send().ok()?;
         let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
         Some(msg_id)
     }
@@ -259,14 +259,30 @@ impl Message {
         let client = reqwest::Client::new();
         let file = media.file_part(&conf.media_dir)?;
         let url =
-            format!("https://api.telegram.org/bot{}/sendPhoto", conf.token);
+            format!("https://api.telegram.org/bot{}/sendDocument", conf.token);
         let form = reqwest::multipart::Form::new()
-            .text("chat_id", &conf.chat_id.to_string())
+            .text("chat_id", (&conf.chat_id).to_string())
             .text("caption", media.caption_timestamped(&self.date))
             .text("reply_to_message_id", self.reply_to_param())
             .part("photo", file);
 
-        let resp = client.post(&url).multipart(form).send().ok()?;
+        let mut resp = client.post(&url).multipart(form).send().ok()?;
+        let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
+        Some(msg_id)
+    }
+
+    fn send_other_media(&self, conf: &Config, media: &Media) -> Option<i64> {
+        let client = reqwest::Client::new();
+        let file = media.file_part(&conf.media_dir)?;
+        let url =
+            format!("https://api.telegram.org/bot{}/sendMessage", conf.token);
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", (&conf.chat_id).to_string())
+            .text("text", media.caption_timestamped(&self.date))
+            .text("reply_to_message_id", self.reply_to_param())
+            .part("photo", file);
+
+        let mut resp = client.post(&url).multipart(form).send().ok()?;
         let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
         Some(msg_id)
     }
@@ -296,6 +312,27 @@ impl Message {
             Some(n) => format!("{:?} ({})", m.media_type, n),
         })
     }
+
+    fn parse_reply_to_new_id(&mut self, conn: &DBConnection) {
+        let old_id = match self.reply_to {
+            None => return,
+            Some(x) => x,
+        };
+
+        use diesel::sql_types::*;
+        let new_id = diesel::dsl::sql::<BigInt>(
+            "
+            SELECT NewID
+            FROM MessageIDMigration
+            WHERE OldID = ?
+            ",
+        )
+        .bind::<BigInt, _>(old_id)
+        .get_result(conn)
+        .ok();
+
+        self.reply_to_new_id = new_id;
+    }
 }
 
 impl diesel::deserialize::QueryableByName<DB> for Message {
@@ -316,7 +353,6 @@ impl diesel::deserialize::QueryableByName<DB> for Message {
 
         Ok(Message {
             id: row.get::<BigInt, _>("id")?,
-            new_id: None,
             user_name: row.get::<Text, _>("first_name")?,
             user_id: row.get::<BigInt, _>("user_id")?,
             date: date,
@@ -398,10 +434,11 @@ fn save_log(msg: &Message, new_id: &Option<i64>) {
 fn process_messages(conn: DBConnection, conf: Config) {
     loop {
         let conf = conf.clone();
-        let msg = match fetch_next_message(&conn) {
+        let mut msg = match fetch_next_message(&conn) {
             None => break,
             Some(m) => m,
         };
+        msg.parse_reply_to_new_id(&conn);
         let id = msg.send_request(&conf);
         save_log(&msg, &id);
     }
