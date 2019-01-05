@@ -1,5 +1,4 @@
 // extern crate clap;
-#[macro_use]
 extern crate diesel;
 
 #[macro_use]
@@ -10,22 +9,14 @@ extern crate serde_derive;
 //
 use chrono::{DateTime, Local};
 use diesel::{Connection, RunQueryDsl};
-use futures::{future, Future, Stream};
 use serde;
 use std;
 use std::path::{Path, PathBuf};
-use telegram_bot_fork as tg;
-use telegram_bot_fork_raw as tg_raw;
 
 const MAX_RETRIES: usize = 4;
 
 type DB = diesel::sqlite::Sqlite;
 type DBConnection = diesel::SqliteConnection;
-type TGRequest<T, K> = dyn tg::types::Request<
-    Type = tg_raw::requests::_base::JsonRequestType<T>,
-    Response = tg_raw::requests::_base::JsonIdResponse<K>,
->;
-type TGMessageRequest<'a> = TGRequest<tg::SendMessage<'a>, tg::Message>;
 
 fn get_args() -> clap::ArgMatches<'static> {
     use clap::Arg;
@@ -162,7 +153,7 @@ impl Media {
     }
 
     fn caption(&self) -> String {
-        let mut s = format!("({})", self.media_type);
+        let s = format!("({})", self.media_type);
         match &self.name {
             Some(n) => format!("{} {}", s, n),
             None => s,
@@ -227,25 +218,13 @@ impl Message {
         }
     }
 
-    fn send_text(&self, conf: &Config) -> Option<i64> {
-        let bot = tg::Api::new(&conf.token).unwrap();;
-        let req = tg::requests::SendMessage::new(
-            tg::types::ChatId::new(conf.chat_id),
-            self.text_content(),
-        );
-        tokio::runtime::current_thread::block_on_all(future::lazy(move || {
-            bot.send(req).map(|msg| msg.id.into())
-        }))
-        .ok()
-    }
-
     fn send_photo(&self, conf: &Config, media: &Media) -> Option<i64> {
         let client = reqwest::Client::new();
         let file = media.file_part(&conf.media_dir)?;
         let url =
             format!("https://api.telegram.org/bot{}/sendPhoto", conf.token);
         let form = reqwest::multipart::Form::new()
-            .text("chat_id",(&conf.chat_id).to_string())
+            .text("chat_id", (&conf.chat_id).to_string())
             .text("caption", media.caption_timestamped(&self.date))
             .text("reply_to_message_id", self.reply_to_param())
             .part("photo", file);
@@ -273,14 +252,26 @@ impl Message {
 
     fn send_other_media(&self, conf: &Config, media: &Media) -> Option<i64> {
         let client = reqwest::Client::new();
-        let file = media.file_part(&conf.media_dir)?;
         let url =
             format!("https://api.telegram.org/bot{}/sendMessage", conf.token);
         let form = reqwest::multipart::Form::new()
             .text("chat_id", (&conf.chat_id).to_string())
             .text("text", media.caption_timestamped(&self.date))
-            .text("reply_to_message_id", self.reply_to_param())
-            .part("photo", file);
+            .text("reply_to_message_id", self.reply_to_param());
+
+        let mut resp = client.post(&url).multipart(form).send().ok()?;
+        let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
+        Some(msg_id)
+    }
+
+    fn send_text(&self, conf: &Config) -> Option<i64> {
+        let client = reqwest::Client::new();
+        let url =
+            format!("https://api.telegram.org/bot{}/sendMessage", conf.token);
+        let form = reqwest::multipart::Form::new()
+            .text("chat_id", (&conf.chat_id).to_string())
+            .text("text", self.text_content())
+            .text("reply_to_message_id", self.reply_to_param());
 
         let mut resp = client.post(&url).multipart(form).send().ok()?;
         let msg_id = resp.json::<WithMessageId>().ok()?.message_id;
@@ -295,22 +286,16 @@ impl Message {
     }
 
     fn text_content(&self) -> String {
-        if self.text.len() > 0 {
+        let content = if self.text.len() > 0 {
             format!("{}:\n{}", self.user_name, self.text)
         } else {
             format!("(from {})", self.user_name)
-        }
+        };
+        format!("{}\n{}", content, self.format_date())
     }
 
     fn format_date(&self) -> String {
         self.date.to_rfc3339()
-    }
-
-    fn media_desc(&self) -> Option<String> {
-        self.media.as_ref().map(|m| match &m.name {
-            None => format!("{:?}", m.media_type),
-            Some(n) => format!("{:?} ({})", m.media_type, n),
-        })
     }
 
     fn parse_reply_to_new_id(&mut self, conn: &DBConnection) {
@@ -364,30 +349,34 @@ impl diesel::deserialize::QueryableByName<DB> for Message {
     }
 }
 
-fn convert_id(old_id: i64, conn: &DBConnection) -> Option<i64> {
-    use diesel::sql_types::*;
-    diesel::dsl::sql::<BigInt>(
-        "
-        SELECT NewID
-        FROM MessageIDMigration
-        WHERE OldID = ?
-        AND NewID IS NOT NULL
-        ",
-    )
-    .bind::<BigInt, _>(old_id)
-    .get_result(conn)
-    .ok()
-}
-
-fn next_message_id_query(conn: &DBConnection) -> Option<i64> {
+fn pending_message_id(conn: &DBConnection) -> Option<i64> {
     use diesel::sql_types::*;
     diesel::dsl::sql::<BigInt>(
         "
         SELECT OldID
         FROM MessageIDMigration
         WHERE NewID IS NULL
-        AND Retries <= {}
-        ORDER BY UpdatedAt ASC
+        ORDER BY Retries ASC, UpdatedAt ASC
+        AND Retries <= ?
+        LIMIT 1
+        ",
+    )
+    .bind::<BigInt, _>(MAX_RETRIES as i64)
+    .get_result(conn)
+    .ok()
+}
+
+fn vacant_message_id(conn: &DBConnection) -> Option<i64> {
+    use diesel::sql_types::*;
+    diesel::dsl::sql::<BigInt>(
+        "
+        SELECT ID
+        FROM Message
+        WHERE ID NOT IN (
+            SELECT OldID
+            FROM MessageIDMigration
+        )
+        ORDER BY Date ASC
         LIMIT 1
         ",
     )
@@ -397,10 +386,11 @@ fn next_message_id_query(conn: &DBConnection) -> Option<i64> {
 
 fn fetch_next_message(conn: &DBConnection) -> Option<Message> {
     use diesel::sql_types::*;
-    let next_msg_id = match next_message_id_query(conn) {
-        None => return None,
-        Some(x) => x,
-    };
+    let next_msg_id =
+        match pending_message_id(conn).or_else(|| vacant_message_id(conn)) {
+            None => return None,
+            Some(x) => x,
+        };
 
     diesel::sql_query(format!(
         "
@@ -427,8 +417,57 @@ fn fetch_next_message(conn: &DBConnection) -> Option<Message> {
     .ok()
 }
 
-fn save_log(msg: &Message, new_id: &Option<i64>) {
-    unimplemented!()
+fn increment_retries(conn: &DBConnection, old_id: i64) {
+    use diesel::sql_types::*;
+    diesel::sql_query(
+        "
+        UPDATE MessageIDMigration
+        SET Retries = Retries + 1
+        WHERE OldID = ?
+        ",
+    )
+    .bind::<BigInt, _>(old_id)
+    .execute(conn)
+    .ok();
+}
+fn save_new_id(conn: &DBConnection, old_id: i64, new_id: i64) {
+    use diesel::sql_types::*;
+    diesel::sql_query(
+        "
+        UPDATE MessageIDMigration
+        SET NewID = ?
+        WHERE OldID = ?
+        ",
+    )
+    .bind::<BigInt, _>(new_id)
+    .bind::<BigInt, _>(old_id)
+    .execute(conn)
+    .ok();
+}
+
+fn record_id_log(conn: &DBConnection, msg: &Message, new_id: Option<i64>) {
+    use diesel::sql_types::*;
+    let old_id = msg.id;
+    let now_timestamp = Local::now().timestamp();
+
+    diesel::sql_query(
+        "
+        INSERT INTO MessageIDMigration (OldID, UpdatedAt)
+        VALUES (?, ?)
+        ON CONFLICT DO
+        UPDATE SET UpdatedAt = ?
+        ",
+    )
+    .bind::<BigInt, _>(old_id)
+    .bind::<BigInt, _>(now_timestamp)
+    .bind::<BigInt, _>(now_timestamp)
+    .execute(conn)
+    .ok();
+
+    match new_id {
+        None => increment_retries(conn, old_id),
+        Some(new_id) => save_new_id(conn, old_id, new_id),
+    };
 }
 
 fn process_messages(conn: DBConnection, conf: Config) {
@@ -440,7 +479,7 @@ fn process_messages(conn: DBConnection, conf: Config) {
         };
         msg.parse_reply_to_new_id(&conn);
         let id = msg.send_request(&conf);
-        save_log(&msg, &id);
+        record_id_log(&conn, &msg, id);
     }
 }
 
@@ -450,7 +489,7 @@ fn init_db_table(conn: &DBConnection) {
         CREATE TABLE IF NOT EXISTS MessageIDMigration (
             ID INTEGER PRIMARY KEY,
             ContextID INTEGER,
-            OldID INTEGER,
+            OldID INTEGER UNIQUE,
             NewID INTEGER,
             Retries INTEGER DEFAULTS 0
             UpdatedAt INTEGER
@@ -476,6 +515,4 @@ fn main() {
     init_db_table(&conn);
 
     process_messages(conn, conf);
-
-    println!("Hello, world! {:?}", args);
 }
