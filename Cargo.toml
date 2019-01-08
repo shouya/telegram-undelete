@@ -5,16 +5,11 @@ authors = ["Shou Ya <shouya@users.noreply.github.com>"]
 edition = "2018"
 
 [dependencies]
-telegram-bot-fork = "0.7"
-telegram-bot-fork-raw = "0.7"
 diesel = { version = "1.0.0", features = ["sqlite", "chrono"] }
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = "2.32"
-tokio = "0.1"
-futures = "0.1"
-stream_throttle = "0.2"
-reqwest = { path = "../reqwest" }
+reqwest = { git = "https://github.com/shouya/reqwest.git" }
 glob = "0.2"

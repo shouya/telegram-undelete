@@ -426,8 +426,8 @@ fn pending_message_id(conn: &DBConnection) -> Option<i64> {
         SELECT OldID
         FROM MessageIDMigration
         WHERE NewID IS NULL
+        AND Retries <= 1
         ORDER BY UpdatedAt ASC, Retries ASC
-        AND Retries <= ?
         LIMIT 1
         ",
     )
@@ -446,6 +446,7 @@ fn vacant_message_id(conn: &DBConnection) -> Option<i64> {
             SELECT OldID
             FROM MessageIDMigration
         )
+        AND ServiceAction IS NULL
         ORDER BY Date ASC
         LIMIT 1
         ",
@@ -478,6 +479,7 @@ fn fetch_message(conn: &DBConnection, id: i64) -> Option<Message> {
         LEFT JOIN USER    AS u ON m.FromID  = u.ID
         LEFT JOIN MEDIA   AS p ON m.MediaID = p.ID
         WHERE m.ID >= ?
+        AND m.ServiceAction IS NULL
         ORDER BY m.Date ASC
         LIMIT 1;
         ",
@@ -489,30 +491,36 @@ fn fetch_message(conn: &DBConnection, id: i64) -> Option<Message> {
 
 fn increment_retries(conn: &DBConnection, old_id: i64) {
     use diesel::sql_types::*;
+    let now_timestamp = Local::now().timestamp();
     diesel::sql_query(
         "
         UPDATE MessageIDMigration
-        SET Retries = Retries + 1
+        SET Retries = Retries + 1,
+            UpdatedAt = ?
         WHERE OldID = ?
         ",
     )
+    .bind::<BigInt, _>(now_timestamp)
     .bind::<BigInt, _>(old_id)
     .execute(conn)
-    .ok();
+    .expect("Unable to increment");
 }
 fn save_new_id(conn: &DBConnection, old_id: i64, new_id: i64) {
     use diesel::sql_types::*;
+    let now_timestamp = Local::now().timestamp();
     diesel::sql_query(
         "
         UPDATE MessageIDMigration
-        SET NewID = ?
+        SET NewID = ?,
+            UpdatedAt = ?
         WHERE OldID = ?
         ",
     )
     .bind::<BigInt, _>(new_id)
+    .bind::<BigInt, _>(now_timestamp)
     .bind::<BigInt, _>(old_id)
     .execute(conn)
-    .ok();
+    .expect("Unable to save new id");
 }
 
 fn record_id_log(conn: &DBConnection, msg: &Message, new_id: Option<i64>) {
@@ -524,15 +532,12 @@ fn record_id_log(conn: &DBConnection, msg: &Message, new_id: Option<i64>) {
         "
         INSERT INTO MessageIDMigration (OldID, UpdatedAt)
         VALUES (?, ?)
-        ON CONFLICT (OldID)
-        DO UPDATE SET UpdatedAt = ?
         ",
     )
     .bind::<BigInt, _>(old_id)
     .bind::<BigInt, _>(now_timestamp)
-    .bind::<BigInt, _>(now_timestamp)
     .execute(conn)
-    .expect("Failed creating id migration record");
+    .ok();
 
     match new_id {
         None => increment_retries(conn, old_id),
