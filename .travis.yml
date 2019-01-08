@@ -1,0 +1,9 @@
+langauge: rust
+rust:
+  - stable
+cache: cargo
+
+script:
+  - cargo build --verbose --all
+
+
