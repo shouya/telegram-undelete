@@ -1,3 +1,4 @@
+[![Build Status](https://travis-ci.org/shouya/telegram-undelete.svg?branch=master)](https://travis-ci.org/shouya/telegram-undelete)
 
 ## Usage
 
@@ -37,7 +38,7 @@ telegram-undelete \
   --bot 119174829:qCf5254nn801BUoNyISil8hDtQpL8IkgAA
 ```
 
-## Caveats
+## Notes
 
 - The program will mutate the sqlite database to save progress in a table named 'MessageIdMigration'.
 
